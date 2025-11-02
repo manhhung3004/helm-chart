@@ -1,21 +1,10 @@
 name: Bento Social CI/CD
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - 'bento-social/**'
   pull_request:
-    paths:
-      - 'bento-social/**'
+    branches: [ master ]
+    types: [ opened, synchronize, reopened ]
   workflow_dispatch:
-
-# Notes / required secrets
-# - REGISTRY: registry hostname (e.g. ghcr.io or my.registry.example)
-# - REGISTRY_USERNAME, REGISTRY_PASSWORD: credentials for registry (optional; required to push)
-# - IMAGE_NAMESPACE: (optional) namespace or org in the registry
-# - KUBE_CONFIG: base64-encoded kubeconfig (required for automatic deploy)
-# - NAMESPACE_PREFIX: (optional) prefix used when creating namespaces (default: "bento")
 
 env:
   # short SHA will be computed in steps when needed
@@ -24,6 +13,7 @@ env:
 jobs:
   lint:
     name: Helm lint
+    if: ${{ github.event.pull_request.head.ref == 'development' }}
     runs-on: ubuntu-latest
     # Running steps inside an Alpine container so commands run in Alpine environment
     container:
@@ -48,6 +38,7 @@ jobs:
 
   build:
     name: Build Docker images
+    if: ${{ github.event.pull_request.head.ref == 'development' }}
     runs-on: ubuntu-latest
     needs: lint
     steps:
@@ -58,14 +49,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-
-      - name: Login to registry (if credentials provided)
-        if: ${{ secrets.REGISTRY && secrets.REGISTRY_USERNAME && secrets.REGISTRY_PASSWORD }}
-        uses: docker/login-action@v2
-        with:
-          registry: ${{ secrets.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Login to Docker Hub (if DOCKERHUB credentials provided)
         if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
@@ -113,6 +96,7 @@ jobs:
 
   prepare_for_argocd:
     name: Prepare chart updates for Argo CD
+    if: ${{ github.event.pull_request.head.ref == 'development' }}
     runs-on: ubuntu-latest
     # Use Alpine container for job steps (note: build job remains on ubuntu-latest because it needs Docker daemon)
     container:
