@@ -1,0 +1,91 @@
+# Corrected Prisma Migrate Job template
+# Replace k8s/prisma-migrate-job/templates/deployment.yaml with this job.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "prisma-migrate-job.fullname" . }}
+  labels:
+    {{- include "prisma-migrate-job.labels" . | nindent 4 }}
+spec:
+  # Job completes after one successful run
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3  # Retry up to 3 times if failed
+  # TTL for cleanup of completed job (86400 = 24 hours)
+  ttlSecondsAfterFinished: 86400
+  
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "prisma-migrate-job.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "prisma-migrate-job.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      
+      # Job must complete before container exits
+      restartPolicy: Never
+      
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          
+          # CRITICAL: Command to run Prisma migration
+          command:
+            - "pnpm"
+            - "prisma"
+            - "migrate"
+            - "deploy"
+          
+          # Environment variables
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "prisma-migrate-job.fullname" . }}-secrets
+                  key: database-url
+            - name: NODE_ENV
+              value: "production"
+          
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          
+          {{- with .Values.volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      
+      {{- with .Values.volumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 12 }}
+      {{- end }}

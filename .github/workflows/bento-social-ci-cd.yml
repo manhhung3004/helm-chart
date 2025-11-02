@@ -1,0 +1,221 @@
+name: Bento Social CI/CD
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'bento-social/**'
+  pull_request:
+    paths:
+      - 'bento-social/**'
+  workflow_dispatch:
+
+# Notes / required secrets
+# - REGISTRY: registry hostname (e.g. ghcr.io or my.registry.example)
+# - REGISTRY_USERNAME, REGISTRY_PASSWORD: credentials for registry (optional; required to push)
+# - IMAGE_NAMESPACE: (optional) namespace or org in the registry
+# - KUBE_CONFIG: base64-encoded kubeconfig (required for automatic deploy)
+# - NAMESPACE_PREFIX: (optional) prefix used when creating namespaces (default: "bento")
+
+env:
+  # short SHA will be computed in steps when needed
+  WORKFLOW: bento-social-ci-cd
+
+jobs:
+  lint:
+    name: Helm lint
+    runs-on: ubuntu-latest
+    # Running steps inside an Alpine container so commands run in Alpine environment
+    container:
+      image: alpine:3.18
+      options: --workdir=/github/workspace
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+
+      - name: Helm lint all charts under bento-social/
+        run: |
+          set -euo pipefail
+          echo "Searching for charts in bento-social/"
+          for d in bento-social/*/; do
+            if [ -f "$d/Chart.yaml" ]; then
+              echo "== Linting $d =="
+              helm lint "$d"
+            fi
+          done
+
+  build:
+    name: Build Docker images
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to registry (if credentials provided)
+        if: ${{ secrets.REGISTRY && secrets.REGISTRY_USERNAME && secrets.REGISTRY_PASSWORD }}
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Login to Docker Hub (if DOCKERHUB credentials provided)
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v2
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build (and optionally push) images for services with Dockerfile
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          IMAGE_NAMESPACE: ${{ secrets.IMAGE_NAMESPACE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=${GIT_SHA:0:8}
+          echo "Short sha: $SHORT_SHA"
+          # Decide registry and namespace: prefer explicit REGISTRY, else Docker Hub if DOCKERHUB_USERNAME provided
+          if [ -z "${REGISTRY:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            REGISTRY=docker.io
+            IMAGE_NAMESPACE="${DOCKERHUB_USERNAME}"
+            echo "No REGISTRY set; using Docker Hub as docker.io/${IMAGE_NAMESPACE}"
+          fi
+
+          for d in bento-social/*/; do
+            if [ -f "$d/Dockerfile" ]; then
+              svc=$(basename "$d")
+              if [ -n "${REGISTRY:-}" ]; then
+                image="$REGISTRY/${IMAGE_NAMESPACE}/${svc}:$SHORT_SHA"
+              else
+                image="${svc}:$SHORT_SHA"
+              fi
+              echo "Building $svc -> $image"
+              docker build -t "$image" "$d"
+              if [ -n "${REGISTRY:-}" ]; then
+                echo "Pushing $image"
+                docker push "$image"
+              else
+                echo "REGISTRY not set; not pushing $image"
+              fi
+            fi
+          done
+
+  prepare_for_argocd:
+    name: Prepare chart updates for Argo CD
+    runs-on: ubuntu-latest
+    # Use Alpine container for job steps (note: build job remains on ubuntu-latest because it needs Docker daemon)
+    container:
+      image: alpine:3.18
+      options: --workdir=/github/workspace
+    needs: build
+    steps:
+      - name: Checkout repository (with write access)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install yq (mikefarah) and jq
+        run: |
+          set -euo pipefail
+          YQ_BIN=/usr/local/bin/yq
+          if ! command -v yq >/dev/null; then
+            echo "Installing yq"
+            wget -qO "$YQ_BIN" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" && chmod +x "$YQ_BIN"
+          fi
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+      - name: (Optional) Fetch secrets from Vault
+        if: ${{ secrets.VAULT_ADDR && secrets.VAULT_TOKEN && secrets.VAULT_SECRETS_MAPPING }}
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          method: token
+          token: ${{ secrets.VAULT_TOKEN }}
+          # VAULT_SECRETS should contain mappings like 'secret/data/path#key:ENV_VAR'
+          secrets: ${{ secrets.VAULT_SECRETS }}
+
+      - name: Update chart values with new image tags (for Argo CD to sync)
+        env:
+          GIT_SHA: ${{ github.sha }}
+          REGISTRY: ${{ secrets.REGISTRY }}
+          IMAGE_NAMESPACE: ${{ secrets.IMAGE_NAMESPACE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          VAULT_SECRETS_MAPPING: ${{ secrets.VAULT_SECRETS_MAPPING }}
+          GIT_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=${GIT_SHA:0:8}
+          echo "Preparing image updates with tag $SHORT_SHA"
+
+          # For each chart under bento-social, update image.repository and image.tag in values.yaml
+          for d in bento-social/*/; do
+            if [ -f "$d/Chart.yaml" ]; then
+              svc=$(basename "$d")
+              values_file="$d/values.yaml"
+              echo "Updating $values_file"
+              # If REGISTRY not provided but DOCKERHUB_USERNAME set, use docker.io/<user>
+              if [ -z "${REGISTRY:-}" ] && [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+                REGISTRY=docker.io
+                IMAGE_NAMESPACE="${DOCKERHUB_USERNAME}"
+              fi
+
+              if [ -n "$REGISTRY" ]; then
+                repo="$REGISTRY/${IMAGE_NAMESPACE}/${svc}"
+                yq e -i ".image.repository = \"$repo\"" "$values_file"
+              fi
+              yq e -i ".image.tag = \"$SHORT_SHA\"" "$values_file"
+
+              # If VAULT_SECRETS_MAPPING provided, expect lines like: ENV_VAR:yaml.path
+              # Example: DB_PASSWORD:secrets.db.password
+              if [ -n "${VAULT_SECRETS_MAPPING:-}" ]; then
+                echo "Applying vault secrets mapping to $values_file"
+                echo "$VAULT_SECRETS_MAPPING" | tr '\r' '\n' | while IFS= read -r mapping || [ -n "$mapping" ]; do
+                  if [ -z "$mapping" ]; then
+                    continue
+                  fi
+                  ENV_VAR=$(echo "$mapping" | cut -d: -f1)
+                  YAML_PATH=$(echo "$mapping" | cut -d: -f2-)
+                  # Use env value exported by vault-action (or from secrets) to set YAML path
+                  VAL=${!ENV_VAR:-}
+                  if [ -n "$VAL" ]; then
+                    # yq path expects dot notation; set using strenv to keep proper quoting
+                    export "${ENV_VAR}=$VAL"
+                    yq e -i ".${YAML_PATH} = strenv(${ENV_VAR})" "$values_file"
+                  else
+                    echo "Warning: env var $ENV_VAR not set; skipping mapping $mapping"
+                  fi
+                done
+              fi
+            fi
+          done
+
+      - name: Commit and push chart changes for Argo CD
+        env:
+          GIT_BRANCH: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git add bento-social/*/values.yaml || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "ci: update bento-social images -> ${{ github.sha }}" || true
+          # Push back to the same branch that triggered the workflow (may fail for fork PRs)
+          git push origin "HEAD:$GIT_BRANCH"

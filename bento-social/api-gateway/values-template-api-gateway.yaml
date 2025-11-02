@@ -1,0 +1,116 @@
+# Fixed values.yaml for api-gateway service
+# Replace your existing k8s/api-gateway/values.yaml with this
+
+replicaCount: 2
+
+image:
+  # ⚠️ CHANGE THIS: Replace with your actual container registry
+  repository: your-registry.azurecr.io/bento-api-gateway
+  pullPolicy: IfNotPresent
+  tag: "latest"  # Override at deploy time with CI: --set image.tag=sha-abc123
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+app:
+  containerPort: 3000
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: api.yourdomain.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: api-tls
+    #   hosts:
+    #     - api.yourdomain.com
+
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs:
+    - name: gateway
+      sectionName: http
+  hostnames:
+    - api.yourdomain.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+# Resource requests/limits for api-gateway
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+# Health probes with correct endpoints
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Enable autoscaling
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Environment variables
+env:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+
+# Secrets reference (will be created separately)
+secrets:
+  databaseUrl: "postgresql://user:password@postgres:5432/bento_db"
+  jwtSecret: "your-jwt-secret-key"
